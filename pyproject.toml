@@ -1,0 +1,39 @@
+[project]
+name = "neurobe4"
+version = "0.1_dev"
+authors = [
+  { name="Joshua H. Wu", email="joshua.wu@duke.edu" },
+]
+description = "Neurobehavioral Forecasting"
+readme = "README.md"
+requires-python = ">=3.9"
+license ={file = "LICENSE"}
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.9",
+]
+dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/joshuahwu/neurobe4"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+write_to = "src/neurobe4/version.py"
+version_scheme = 'python-simplified-semver'
+local_scheme = 'no-local-version'
+
+# [project.optional-dependencies]
+# docs = [
+#     "mkdocs",
+#     "mkdocstrings[python]",
+#     "mkdocs_section_index",
+#     "mkdocs_gen_files",
+#     "mkdocs_literate_nav",
+#     "mkdocs-gallery",
+# ]
