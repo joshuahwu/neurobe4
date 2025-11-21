@@ -3,8 +3,8 @@ from scrubvae.params import read
 from pathlib import Path
 import wandb
 import argparse
-import get
-from trainer import train
+from neurobe4.get import get
+from neurobe4.train.trainer import train
 
 # argparse project and job names
 parser = argparse.ArgumentParser(prog="SC-VAE Train", description="Train SC-VAE models")
@@ -41,7 +41,7 @@ loader_dict, model = get.get_data_and_model(
     train_val_test=["train", "val"],
     data_keys=["x6d", "root", "offsets", "target_pose"] + config["model"]["conditional_keys"],
     shuffle=[True,False],
-    n_time_steps=0 if config["model"]["type"] == "mlp" else 1,
+    n_time_steps=0 if "mlp" in config["model"]["type"] else 1,
 )
 
 # Train model
