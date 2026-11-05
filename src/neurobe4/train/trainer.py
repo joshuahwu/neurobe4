@@ -9,12 +9,9 @@ from sklearn.metrics import r2_score
 import numpy as np
 from line_profiler import profile
 from pathlib import Path
-from scrubvae.model.residual import ConditionalForecaster, ForecastingVAE
-from neurobe4.model.model import (
-    DenoiseDiffusion,
-    DiffVAE,
-)
-
+from neurobe4.train.losses import get_batch_loss
+from neurobe4.data.train_utils import prepare_batch
+from neurobe4.model import ConditionalDiffusion
 
 class CyclicalBetaAnnealing(torch.nn.Module):
     def __init__(self, beta_max=1, len_cycle=100, R=0.5):
@@ -31,6 +28,7 @@ class CyclicalBetaAnnealing(torch.nn.Module):
             beta = self.beta_max * remainder / self.len_increasing
 
         return beta
+
 
 def get_beta_schedule(schedule, beta):
     if schedule == "cyclical":
@@ -86,7 +84,12 @@ def get_optimizer_and_lr_scheduler(
 
 
 def predict_batch(model, data):
-    data_i = {k: v for k, v in data.items() if (k in ["x6d", "root", "var"])}
+    data_i = {
+        k: v
+        for k, v in data.items()
+        # partner windows and relative poses: social (SocialConditionalDiffusion) batches
+        if k in ["x6d", "root", "var", "x6d_partner", "root_partner", "rel_pose"]
+    }
 
     return model(data_i)
 
@@ -101,99 +104,91 @@ def train_test_epoch(
     optimizer=None,
     scheduler=None,
     mode="train",
-    # get_z=False,
 ):
-    model.train()
+    if mode == "train":
+        model.train()
+        grad_env = torch.enable_grad
+    elif mode == "test":
+        model.eval()
+        grad_env = torch.no_grad
+    else:
+        raise ValueError("This mode is not recognized.")
+    
     if config["train"]["freeze_ae"]:
-        # if isinstance(model, ConditionalDiffusion):
-        #     for param in model.future_encoder.parameters():
-        #         param.requires_grad = False
-        # else:
         for param in model.encoder.parameters():
             param.requires_grad = False
 
         for param in model.decoder.parameters():
             param.requires_grad = False
+        model.encoder.eval()
+        model.decoder.eval()
 
     model.mi_estimator = None
     epoch_metrics = {k: 0 for k in ["total"] + list(config["loss"].keys())}
-    for batch_idx, data in enumerate(loader):
-        data = {k: v.to(device) for k, v in data.items()}
+    with grad_env():
+        for batch_idx, data in enumerate(loader):
+            # Raw poses -> x6d, root, offsets, target_pose (augment only in training)
+            data = prepare_batch(
+                data,
+                loader.dataset,
+                augment_dict=config["train"]["augmentations"] if mode == "train" else None,
+                device=device,
+            )
+            if ("vae_z" in data.keys()) and isinstance(model, ConditionalDiffusion):
+                # Cached target latent (window 1); z_past still encoded from window 0
+                data_o = model.encode(data)
+            elif "vae_z" in data.keys():
+                # Train directly on cached latents (window 0 conditions, window 1 is the target)
+                # (classifier-free guidance masking happens in model.build_cond)
+                data_o = {"z_past": data["vae_z"][:, 0], "mu": data["vae_z"][:, 1]}
+            else:
+                data_o = predict_batch(model, data)
 
-        data_o = predict_batch(model, data)
+            batch_loss = get_batch_loss(
+                model,
+                data,
+                data_o,
+                config["loss"],
+            )
 
-        batch_loss = get_batch_loss(
-            model,
-            data,
-            data_o,
-            config["loss"],
-            model.ddpm if hasattr(model, "ddpm") else None,
-        )
+            if mode == "train":
+                # Update model parameters
+                for param in model.parameters():
+                    param.grad = None
 
-        if mode == "train":
-            # Update model parameters
-            for param in model.parameters():
-                param.grad = None
-            
-            batch_loss["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1e6)
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step(epoch + batch_idx / len(loader))
+                batch_loss["total"].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1e6)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step(epoch + batch_idx / len(loader))
 
-        # Save loss and other metrics for the epoch
-        epoch_metrics = {
-            k: v + batch_loss[k].detach() for k, v in epoch_metrics.items()
-        }
+            # Save loss and other metrics for the epoch
+            epoch_metrics = {
+                k: v + batch_loss[k].detach() for k, v in epoch_metrics.items()
+            }
 
-    for k, v in epoch_metrics.items():
-        epoch_metrics[k] = v.item() / len(loader)
-        print(
-            "====> Epoch: {} Average {} loss: {:.4f}".format(epoch, k, epoch_metrics[k])
-        )
+        for k, v in epoch_metrics.items():
+            epoch_metrics[k] = v.item() / len(loader)
+            print(
+                "====> Epoch: {} Average {} loss: {:.4f}".format(epoch, k, epoch_metrics[k])
+            )
 
     return epoch_metrics
 
 
 def test_epoch(config, model, loader, device="cuda", epoch=0):
-    print("Running test epoch")
-
-    model.eval()
-    with torch.no_grad():
-        # z = []
-        epoch_metrics = {k: 0 for k in ["total"] + list(config["loss"].keys())}
-
-        # if (
-        #     # isinstance(model, ConditionalDiffusion)
-        #     isinstance(model, NCConditionalDiffusion)
-        #     or isinstance(model, DiffVAE)
-        # ):
-        #     ddpm = DenoiseDiffusion(n_steps=1000)
-        # else:
-        #     ddpm = None
-
-        for batch_idx, data in enumerate(loader):
-            data = {k: v.to(device) for k, v in data.items()}
-            data_o = predict_batch(model, data)
-
-            batch_metrics = get_batch_loss(
-                model,
-                data,
-                data_o,
-                config["loss"],
-                model.ddpm if hasattr(model, "ddpm") else None,
-            )
-            epoch_metrics = {
-                k: v + batch_metrics[k].detach() for k, v in epoch_metrics.items()
-            }
-
-    for k, v in epoch_metrics.items():
-        epoch_metrics[k] = v.item() / len(loader)
-        print(
-            "====> Epoch: {} Average {} loss: {:.4f}".format(epoch, k, epoch_metrics[k])
-        )
-
-    return epoch_metrics  # , torch.cat(z, dim=0).cpu()
+    epoch_metrics = train_test_epoch(
+        config=config,
+        model=model,
+        loader=loader,
+        optimizer=None,
+        scheduler=None,
+        device=device,
+        epoch=epoch,
+        mode="test",
+        # get_z=False,
+    )
+    return epoch_metrics
 
 
 def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoch=0):
@@ -211,8 +206,9 @@ def train_epoch(config, model, loader, optimizer, scheduler, device="cuda", epoc
 
     return epoch_metrics
 
+
 @profile
-def train(config, model, loader_dict, run=None):
+def train(config, model, loader_dict, run=None, device="cuda"):
     torch.set_float32_matmul_precision("medium")
     torch.autograd.set_detect_anomaly(True)
     torch.backends.cudnn.benchmark = True
@@ -250,7 +246,7 @@ def train(config, model, loader_dict, run=None):
             loader=loader_dict["train"],
             optimizer=optimizer,
             scheduler=scheduler,
-            device="cuda",
+            device=device,
             epoch=epoch,
         )
         metrics = {"{}_train".format(k): v for k, v in train_metrics.items()}
@@ -276,7 +272,7 @@ def train(config, model, loader_dict, run=None):
                     config=config,
                     model=model,
                     loader=loader_dict["val"],
-                    device="cuda",
+                    device=device,
                     epoch=epoch,
                 )
                 metrics.update(

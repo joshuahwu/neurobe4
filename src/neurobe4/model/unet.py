@@ -127,43 +127,43 @@ class TransformerForecast(nn.Module):
         return z
         
 
-config = read.config(RESULTS_PATH + "vanilla/64/model_config.yaml")
-connectivity = read.connectivity_config(config["data"]["skeleton_path"])
-epoch = 300
-stride = 1
-n_steps = 4
+# config = read.config(RESULTS_PATH + "vanilla/64/model_config.yaml")
+# connectivity = read.connectivity_config(config["data"]["skeleton_path"])
+# epoch = 300
+# stride = 1
+# n_steps = 4
 
-loader = scrubvae.get.mouse_data(
-    data_config=config["data"],
-    window=config["model"]["window"],
-    train=True,
-    data_keys=["x6d", "root", "offsets", "avg_speed"],
-    shuffle=False,
-    normalize=[],
-)
-window = config["model"]["window"]
-n_keypts = loader.dataset.n_keypts
-kinematic_tree = loader.dataset.kinematic_tree
+# loader = scrubvae.get.mouse_data(
+#     data_config=config["data"],
+#     window=config["model"]["window"],
+#     train=True,
+#     data_keys=["x6d", "root", "offsets", "avg_speed"],
+#     shuffle=False,
+#     normalize=[],
+# )
+# window = config["model"]["window"]
+# n_keypts = loader.dataset.n_keypts
+# kinematic_tree = loader.dataset.kinematic_tree
 
-z = scrubvae.get.latents(
-    config,
-    model=None,
-    epoch=epoch,
-    loader=loader,
-    dataset_label="Train",
-)
+# z = scrubvae.get.latents(
+#     config,
+#     model=None,
+#     epoch=epoch,
+#     loader=loader,
+#     dataset_label="Train",
+# )
 
-window_inds = loader.dataset.window_inds
-t_diffs = np.diff(window_inds[:, window // 2], prepend=[-10], append=[-10])
-cont_ids = np.diff(np.where(t_diffs != 1)[0])
-cont_ids = np.concatenate([np.zeros(i) + j for j, i in enumerate(cont_ids)])
+# window_inds = loader.dataset.window_inds
+# t_diffs = np.diff(window_inds[:, window // 2], prepend=[-10], append=[-10])
+# cont_ids = np.diff(np.where(t_diffs != 1)[0])
+# cont_ids = np.concatenate([np.zeros(i) + j for j, i in enumerate(cont_ids)])
 
-z_inds = scrubvae.data.dataset.get_window_indices(cont_ids, stride, n_steps + 1)
+# z_inds = scrubvae.data.dataset.get_window_indices(cont_ids, stride, n_steps + 1)
 
-T4 = TransformerForecast(z.shape[-1], seq_len=n_steps - 1).cuda()
-T4(z[z_inds[0:2]].cuda())
+# T4 = TransformerForecast(z.shape[-1], seq_len=n_steps - 1).cuda()
+# T4(z[z_inds[0:2]].cuda())
 
 
-import pdb
+# import pdb
 
-pdb.set_trace()
+# pdb.set_trace()

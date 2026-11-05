@@ -155,12 +155,16 @@ class UNetModel(nn.Module):
 
     def forward(self, x: torch.Tensor, time_steps: torch.Tensor, cond: torch.Tensor):
         """
-        :param x: is the input feature map of shape `[batch_size, channels, width, height]`
+        :param x: is the input feature map of shape `[batch_size, channels, width]`,
+            or a latent vector `[batch_size, width]` (treated as one channel)
         :param time_steps: are the time steps of shape `[batch_size]`
         :param cond: conditioning of shape `[batch_size, n_cond, d_cond]`
         """
-        x = x[:, None,...]
-        cond = cond[:, None,...]
+        if x.dim() == 2:
+            x = x[:, None,...]
+        if cond.dim() == 2:
+            # Single conditioning vector -> one token
+            cond = cond[:, None,...]
         # To store the input half outputs for skip connections
         x_input_block = []
 
@@ -182,6 +186,72 @@ class UNetModel(nn.Module):
         # Final normalization and $3 \times 3$ convolution
         return self.out(x)
 
+
+
+class LatentUNet(nn.Module):
+    """
+    Denoiser for a latent vector: a linear layer maps the latent (latent_dim,)
+    to a learned (grid_channels, grid_length) feature map -- every position a
+    mix of all latent dimensions, so the U-Net's convolutions/down-sampling act
+    along a learned axis rather than the latent dimensions' arbitrary order --
+    plus a learned positional embedding, runs a UNetModel with attention at
+    every level, and maps the output back to latent_dim with a linear head.
+
+    Same interface as UNetModel on latent vectors: forward(x (B, latent_dim),
+    time_steps, cond) -> (B, 1, latent_dim).
+    """
+
+    def __init__(
+            self, *,
+            latent_dim: int,
+            grid_channels: int,
+            grid_length: int,
+            n_res_blocks: int,
+            channel_multipliers: List[int],
+            n_heads: int,
+            tf_layers: int = 1,
+            d_cond: int = 768):
+        """
+        :param latent_dim: size of the latent vector being denoised
+        :param grid_channels: channels of the feature map (also the U-Net's
+            base channel count; must be a multiple of 32 for GroupNorm)
+        :param grid_length: length of the feature map; must be divisible by
+            2 ** (len(channel_multipliers) - 1) for the down/up-sampling
+        """
+        super().__init__()
+        assert grid_channels % 32 == 0, "grid_channels must be a multiple of 32"
+        assert grid_length % 2 ** (len(channel_multipliers) - 1) == 0, (
+            "grid_length must be divisible by 2 ** (number of levels - 1)"
+        )
+        self.latent_dim = latent_dim
+        self.grid_channels = grid_channels
+        self.grid_length = grid_length
+
+        self.proj_in = nn.Linear(latent_dim, grid_channels * grid_length)
+        self.pos_emb = nn.Parameter(0.02 * torch.randn(1, grid_channels, grid_length))
+        self.unet = UNetModel(
+            in_channels=grid_channels,
+            out_channels=grid_channels,
+            channels=grid_channels,
+            n_res_blocks=n_res_blocks,
+            attention_levels=list(range(len(channel_multipliers))),
+            channel_multipliers=channel_multipliers,
+            n_heads=n_heads,
+            tf_layers=tf_layers,
+            d_cond=d_cond,
+        )
+        self.proj_out = nn.Linear(grid_channels * grid_length, latent_dim)
+
+    def forward(self, x: torch.Tensor, time_steps: torch.Tensor, cond: torch.Tensor):
+        """
+        :param x: noisy latents `[batch_size, latent_dim]` (or `[batch_size, 1, latent_dim]`)
+        :param time_steps: are the time steps of shape `[batch_size]`
+        :param cond: conditioning `[batch_size, d_cond]` or `[batch_size, n_cond, d_cond]`
+        """
+        x = x.reshape(x.shape[0], self.latent_dim)
+        h = self.proj_in(x).view(-1, self.grid_channels, self.grid_length) + self.pos_emb
+        h = self.unet(h, time_steps, cond)
+        return self.proj_out(h.flatten(1))[:, None, :]
 
 class TimestepEmbedSequential(nn.Sequential):
     """

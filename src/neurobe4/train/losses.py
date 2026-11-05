@@ -4,20 +4,18 @@ from scrubvae.data.dataset import fwd_kin_cont6d_torch
 import torch.nn.functional as F
 
 from neurobe4.model.model import (
-    # ConditionalDiffusion,
     DenoiseDiffusion,
-    # NCConditionalDiffusion,
     DiffVAE,
 )
 
-from scrubvae.model.residual import ConditionalForecaster, ForecastingVAE
+from neurobe4.model.model import ConditionalForecaster, ForecastingVAE, ConditionalDiffusion
 
 def diffusion_time_consistency_loss(x, x_hat, kinematic_tree, offsets):
     root_hat = torch.zeros_like(offsets[..., 0, 0, :])
     pose = fwd_kin_cont6d_torch(
         x[:, -1],
         kinematic_tree,
-        offsets[:, 0],
+        offsets,
         root_pos=root_hat,
         do_root_R=False,
         eps=1e-8,
@@ -26,7 +24,7 @@ def diffusion_time_consistency_loss(x, x_hat, kinematic_tree, offsets):
     pose_hat = fwd_kin_cont6d_torch(
         x_hat[:, 0],
         kinematic_tree,
-        offsets[:, 0],
+        offsets,
         root_pos=root_hat,
         do_root_R=False,
         eps=1e-8,
@@ -38,10 +36,12 @@ def diffusion_time_consistency_loss(x, x_hat, kinematic_tree, offsets):
     return loss
 
 
-def get_batch_loss(model, data, data_o, loss_scale, ddpm):
-    is_forecast = data["x6d"].shape[1] == 2
-    batch_size = data["x6d"].shape[0]
+def get_batch_loss(model, data, data_o, loss_scale):
+    is_forecast = getattr(model, "is_forecasting", False)
+    batch_size = data[list(data.keys())[0]].shape[0]
     batch_loss = {}
+    data_gt = data
+
     if "prior" in loss_scale.keys():
         if "L" in data_o.keys():
             batch_loss["prior"] = prior_loss(data_o["mu"], data_o["L"])
@@ -57,80 +57,42 @@ def get_batch_loss(model, data, data_o, loss_scale, ddpm):
 
     if "jpe" in loss_scale.keys():
         batch_loss["jpe"] = mpjpe_loss(
-            data["target_pose"],
+            data_gt["target_pose"],
             data_o["x6d"],
             model.kinematic_tree,
-            data["offsets"][:, 1] if is_forecast else data["offsets"],
+            data_gt["offsets"],
         )
 
     if "diffusion" in loss_scale.keys():
-        cond = []
-        for k in model.diffusion_cond_keys:
-            cond_var = (
-                F.one_hot(data[k].ravel().long(), len(model.discrete_classes[k]))
-                if k in model.discrete_classes.keys()
-                else data[k]
-            )
-            # Classifier free guidance
-            if model.cfg_prob is not None:
-                if model.cfg_prob > 0:
-                    mask = (
-                        torch.rand(batch_size, device=cond_var.device) < model.cfg_prob
-                    )
-                    cond_var[mask, ...] = 0
-            cond += [cond_var]
+        # Forecast horizon (in windows) of each sample's target: drawn per
+        # sample with random_tau, else None (target is window 1)
+        tau = data_gt.get("tau")
 
-        cond = torch.cat([data_o["z_past"]] + cond, dim=-1)
+        # if isinstance(model, (ConditionalDiffusion, DiffVAE)):
+        # Past, extra conditioning variables (read from data_gt) and tau, with
+        # their classifier-free guidance dropout
+        cond = model.build_cond(data_o["z_past"], data_gt, tau)
 
-        if isinstance(model, DiffVAE):
-            cond = cond.detach()
+        # Normalization rows are indexed by horizon: without random_tau every
+        # target is window 1 (row 0 of a per-tau table is the identity)
+        if tau is None:
+            tau = torch.ones(batch_size, dtype=torch.long, device=data_o["mu"].device)
+        # else:
+        #     cond = torch.cat([data_o["z_past"]] + cond, dim=-1)
 
-        if "diffusion_time_consistency_a" in loss_scale.keys():
-            batch_loss["diffusion"], mean_theta = ddpm.loss(
-                eps_model=model.unet, x0=data_o["mu"], cond=cond, return_mean=True
-            )
-
-            data_theta = model.decode(torch.squeeze(mean_theta))
-
-            batch_loss["diffusion_time_consistency_a"] = (
-                diffusion_time_consistency_loss(
-                    data["x6d"][:, 0],
-                    data_theta["x6d"],
-                    model.kinematic_tree,
-                    data["offsets"][:, 1],
-                )
+        if isinstance(model, DiffVAE) and model.forecasting_type == "velocity":
+            batch_loss["diffusion"] = model.ddpm.loss(
+                model=model.unet, x0=data_o["mu"] - data_o["z_past"], cond=cond, tau=tau,
             )
         else:
-            batch_loss["diffusion"] = ddpm.loss(
-                eps_model=model.unet, x0=data_o["mu"], cond=cond, return_mean=False
+            batch_loss["diffusion"] = model.ddpm.loss(
+                model=model.unet, x0=data_o["mu"], cond=cond, tau=tau,
             )
-
-        if "diffusion_time_consistency_b" in loss_scale.keys():
-            mean_theta = ddpm.t0_time_consistency_loss(
-                eps_model=model.unet, x0=data_o["mu"], cond=cond
-            )
-            data_theta = model.decode(torch.squeeze(mean_theta))
-            batch_loss["diffusion_time_consistency_b"] = (
-                diffusion_time_consistency_loss(
-                    data["x6d"][:, 0],
-                    data_theta["x6d"],
-                    model.kinematic_tree,
-                    data["offsets"][:, 1],
-                )
-            )
-
-    if "time_consistency" in loss_scale.keys():
-        batch_loss["time_consistency"] = time_consistency_loss(
-            data["x6d"][:, 1],
-            data_o["x6d"],
-            model.kinematic_tree,
-            data["offsets"][:, 1] if is_forecast else data["offsets"],
-        )
 
     if "root" in loss_scale.keys():
         batch_loss["root"] = (
             torch.nn.MSELoss(reduction="sum")(
-                data_o["root"], data["root"][:, 1] if is_forecast else data["root"]
+                data_o["root"].squeeze(), data_gt["root"][:, 1].squeeze() if is_forecast else data_gt["root"].squeeze()
             )
             / batch_size
         )
